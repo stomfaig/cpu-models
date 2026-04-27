@@ -13,4 +13,12 @@ Memory modules should implement the `Memory<P>` trait, with `P` implementing the
 Then, memory modules should be modelled by `dyn Memory<P>` trait objects. This interface exposes a singe send and receive channels, which is where communication with the memory happens. The upside of this approach is that memory modules expose a uniform interface. However, the downside is that the number and nature of memory ports is obscured (e.g. `SimpleCache` has a separate read and write port, but these are not exposed to the user, rather the requests are sorted.)
 
 
-## Simple
+## Simple cache
+
+A simple cache functional cache implementation can be found in `simple_cache.rs`. The main features of this cache are:
+- Separate read and write ports,
+- Tunable cache geometry
+- Cycle-by-cycle simulation of the cache, that is, depending on the cache bank in which a given data item resides the cache access might take more or less time
+- Always write-through implementation
+
+The cache implementation is somewhat messy due to the fact that per-cycle simulation was a primary goal. This means that one needs a way to implement co-routines that can release control once they've done one cycle's worth of work, and resume execution. This was achieved by implementing a `Port` struct, which provides a wrapped task queue, and a functional implementation of coroutines. See `utils/step.rs`.
