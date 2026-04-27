@@ -1,15 +1,11 @@
-mod isa;
 mod alu;
-mod assembler;
 mod five_stage;
 mod simple_ooo;
-mod circular_buffer;
-mod latch;
-mod diag;
+mod utils;
 
+use five_stage::{FiveStageCpu, forwarding, hazard};
 use std::env;
-use diag::Diagnosable as _;
-use five_stage::{FiveStageCpu, hazard, forwarding};
+use utils::diag::Diagnosable as _;
 
 fn usage() -> ! {
     eprintln!("Usage: cpu-simulator <model> <program>");
@@ -24,9 +20,11 @@ fn usage() -> ! {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 { usage(); }
+    if args.len() < 3 {
+        usage();
+    }
 
-    let model   = &args[1];
+    let model = &args[1];
     let program = &args[2];
 
     // Accept either a file path or an inline assembly string.
@@ -39,7 +37,7 @@ fn main() {
         program.clone()
     };
 
-    let words = assembler::assemble(&source).unwrap_or_else(|e| {
+    let words = utils::assembler::assemble(&source).unwrap_or_else(|e| {
         eprintln!("Assembly error: {e}");
         std::process::exit(1);
     });
@@ -62,13 +60,15 @@ fn run_five_stage(words: Vec<u32>) {
         cpu.load(i * 4, &w.to_le_bytes());
     }
 
-    let cycles = words.len() + 4;  // drain the pipeline
+    let cycles = words.len() + 4; // drain the pipeline
     for _ in 0..cycles {
         cpu.tick();
         cpu.diagnose().print();
         print!("cycle {:3} |", cpu.cycle);
         for (i, &v) in cpu.regs.iter().enumerate().skip(1) {
-            if v != 0 { print!(" x{i}={v}"); }
+            if v != 0 {
+                print!(" x{i}={v}");
+            }
         }
         println!();
     }
@@ -89,7 +89,9 @@ fn run_ooo(words: Vec<u32>) {
         cpu.diagnose().print();
         print!("cycle {:3} |", c + 1);
         for (i, &v) in cpu.regs.iter().enumerate().skip(1) {
-            if v != 0 { print!(" x{i}={v}"); }
+            if v != 0 {
+                print!(" x{i}={v}");
+            }
         }
         println!();
     }
