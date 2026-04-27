@@ -3,36 +3,73 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Opcode {
     // R-type
-    Add, Sub, And, Or, Xor, Sll, Srl, Sra, Slt, Sltu,
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Sll,
+    Srl,
+    Sra,
+    Slt,
+    Sltu,
     // I-type ALU
-    Addi, Andi, Ori, Xori, Slli, Srli, Srai, Slti, Sltiu,
+    Addi,
+    Andi,
+    Ori,
+    Xori,
+    Slli,
+    Srli,
+    Srai,
+    Slti,
+    Sltiu,
     // Loads
-    Lb, Lh, Lw, Lbu, Lhu,
+    Lb,
+    Lh,
+    Lw,
+    Lbu,
+    Lhu,
     // Stores
-    Sb, Sh, Sw,
+    Sb,
+    Sh,
+    Sw,
     // Branches
-    Beq, Bne, Blt, Bge, Bltu, Bgeu,
+    Beq,
+    Bne,
+    Blt,
+    Bge,
+    Bltu,
+    Bgeu,
     // Jumps
-    Jal, Jalr,
+    Jal,
+    Jalr,
     // Upper immediate
-    Lui, Auipc,
+    Lui,
+    Auipc,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum InstrFormat { R, I, S, B, U, J }
+pub enum InstrFormat {
+    R,
+    I,
+    S,
+    B,
+    U,
+    J,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct DecodedInstr {
     pub opcode: Opcode,
     pub format: InstrFormat,
-    pub rd:     u8,
-    pub rs1:    u8,
-    pub rs2:    u8,
-    pub imm:    i32,
+    pub rd: u8,
+    pub rs1: u8,
+    pub rs2: u8,
+    pub imm: i32,
 }
 
 pub struct InstResult {
-    pub rd:     u8,
+    pub rd: u8,
     pub result: u32,
     pub format: InstrFormat,
 }
@@ -41,11 +78,11 @@ pub struct InstResult {
 /// Returns None if the encoding is unrecognized.
 pub fn decode(word: u32) -> Option<DecodedInstr> {
     let opcode_bits = word & 0x7f;
-    let rd          = ((word >> 7)  & 0x1f) as u8;
-    let funct3      = ((word >> 12) & 0x07) as u8;
-    let rs1         = ((word >> 15) & 0x1f) as u8;
-    let rs2         = ((word >> 20) & 0x1f) as u8;
-    let funct7      = ((word >> 25) & 0x7f) as u8;
+    let rd = ((word >> 7) & 0x1f) as u8;
+    let funct3 = ((word >> 12) & 0x07) as u8;
+    let rs1 = ((word >> 15) & 0x1f) as u8;
+    let rs2 = ((word >> 20) & 0x1f) as u8;
+    let funct7 = ((word >> 25) & 0x7f) as u8;
 
     let imm_i = (word as i32) >> 20;
     let imm_s = (((word >> 25) as i32) << 5) | ((word >> 7) & 0x1f) as i32;
@@ -83,7 +120,13 @@ pub fn decode(word: u32) -> Option<DecodedInstr> {
                 0x6 => Opcode::Ori,
                 0x4 => Opcode::Xori,
                 0x1 => Opcode::Slli,
-                0x5 => if funct7 == 0x20 { Opcode::Srai } else { Opcode::Srli },
+                0x5 => {
+                    if funct7 == 0x20 {
+                        Opcode::Srai
+                    } else {
+                        Opcode::Srli
+                    }
+                }
                 0x2 => Opcode::Slti,
                 0x3 => Opcode::Sltiu,
                 _ => return None,
@@ -122,12 +165,19 @@ pub fn decode(word: u32) -> Option<DecodedInstr> {
             };
             (op, InstrFormat::B, imm_b)
         }
-        0b1101111 => (Opcode::Jal,  InstrFormat::J, imm_j),
+        0b1101111 => (Opcode::Jal, InstrFormat::J, imm_j),
         0b1100111 => (Opcode::Jalr, InstrFormat::I, imm_i),
-        0b0110111 => (Opcode::Lui,  InstrFormat::U, imm_u),
+        0b0110111 => (Opcode::Lui, InstrFormat::U, imm_u),
         0b0010111 => (Opcode::Auipc, InstrFormat::U, imm_u),
         _ => return None,
     };
 
-    Some(DecodedInstr { opcode, format, rd, rs1, rs2, imm })
+    Some(DecodedInstr {
+        opcode,
+        format,
+        rd,
+        rs1,
+        rs2,
+        imm,
+    })
 }

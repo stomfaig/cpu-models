@@ -1,8 +1,12 @@
-use crate::isa::Opcode;
-use crate::five_stage::stages::{IfId, IdEx};
+use crate::five_stage::stages::{IdEx, IfId};
+use crate::utils::isa::Opcode;
 
-fn word_rs1(word: u32) -> u8 { ((word >> 15) & 0x1f) as u8 }
-fn word_rs2(word: u32) -> u8 { ((word >> 20) & 0x1f) as u8 }
+fn word_rs1(word: u32) -> u8 {
+    ((word >> 15) & 0x1f) as u8
+}
+fn word_rs2(word: u32) -> u8 {
+    ((word >> 20) & 0x1f) as u8
+}
 
 pub trait HazardPolicy {
     /// Return true if the pipeline should stall — i.e. hold fetch/decode and
@@ -25,9 +29,12 @@ pub struct StallOnLoad;
 
 impl HazardPolicy for StallOnLoad {
     fn should_stall(&self, if_id: &Option<IfId>, id_ex: &Option<IdEx>) -> bool {
-        let (Some(fetch), Some(exec)) = (if_id, id_ex) else { return false; };
+        let (Some(fetch), Some(exec)) = (if_id, id_ex) else {
+            return false;
+        };
 
-        let is_load = matches!(exec.instr.opcode,
+        let is_load = matches!(
+            exec.instr.opcode,
             Opcode::Lb | Opcode::Lbu | Opcode::Lh | Opcode::Lhu | Opcode::Lw
         );
 
