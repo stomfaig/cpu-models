@@ -1,5 +1,6 @@
 mod alu;
 mod five_stage;
+mod memory;
 mod simple_ooo;
 mod utils;
 
