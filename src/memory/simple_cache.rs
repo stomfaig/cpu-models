@@ -2,9 +2,10 @@ use crate::memory::mem_fabric::{
     MemProtocol, Memory, ReadReq, ReadResp, RequestId, SimpleRW, SimpleRWReq, SimpleRWResp,
     WriteReq, WriteResp,
 };
+use crate::memory::tree_lru::TreeLRUPolicy;
 use crate::utils::step::{Port, Step, SteppedProcess};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /*
   Simple Cache
@@ -48,12 +49,24 @@ impl CacheData {
     fn bank_size(&self) -> usize {
         1 << self.k
     }
+
+    fn insert_value(&mut self, addr: u32, bank: u32, val: u32) {
+        let index = (self.mask() & addr) as usize;
+        let tag = addr >> self.k as u32;
+        let bank_size = self.bank_size();
+        self.table[index + (bank as usize) * bank_size] = PTE {
+            valid: true,
+            tag,
+            val,
+        };
+    }
 }
 
 // Read port
 #[derive(Clone, Copy)]
 struct ReadCtx {
     request_id: RequestId,
+    addr: u32,
     index: usize,
     tag: u32,
     bank_to_check: usize,
@@ -61,28 +74,44 @@ struct ReadCtx {
 
 struct ReadPort;
 
+struct ReadPortResult {
+    request_id: RequestId,
+    addr: u32,
+    val_and_bank: Option<(u32, usize)>,
+}
+
 impl SteppedProcess<ReadReq, CacheData> for ReadPort {
     type Ctx = ReadCtx;
-    type Result = (RequestId, Option<u32>);
+    // (request_id, addr, Some((val, hitting_bank)) on hit | None on miss)
+    type Result = ReadPortResult;
 
     fn create_context(data: &CacheData, task: ReadReq, request_id: u8) -> ReadCtx {
         let addr = task.0;
         let mask = data.mask();
         ReadCtx {
             request_id,
+            addr,
             index: (mask & addr) as usize,
             tag: addr >> data.k as u32,
             bank_to_check: 0,
         }
     }
 
-    fn step(data: &mut CacheData, ctx: &ReadCtx) -> Step<ReadCtx, (RequestId, Option<u32>)> {
+    fn step(data: &mut CacheData, ctx: &ReadCtx) -> Step<ReadCtx, ReadPortResult> {
         if ctx.bank_to_check >= data.assoc() {
-            return Step::Done((ctx.request_id, None));
+            return Step::Done(ReadPortResult {
+                request_id: ctx.request_id,
+                addr: ctx.addr,
+                val_and_bank: None,
+            });
         }
         let pte = &data.table[ctx.bank_to_check * data.bank_size() + ctx.index];
         if pte.valid && pte.tag == ctx.tag {
-            return Step::Done((ctx.request_id, Some(pte.val)));
+            return Step::Done(ReadPortResult {
+                request_id: ctx.request_id,
+                addr: ctx.addr,
+                val_and_bank: Some((pte.val, ctx.bank_to_check)),
+            });
         }
         Step::Continue(ReadCtx {
             bank_to_check: ctx.bank_to_check + 1,
@@ -143,6 +172,21 @@ impl SteppedProcess<WriteReq, CacheData> for WritePort {
     }
 }
 
+pub trait EvictionPolicy {
+    fn new(assoc: u32, lines_per_bank: u32) -> Self
+    where
+        Self: Sized;
+
+    fn log_hit(&mut self, line: u32, bank: u32);
+    fn get_eviction_id(&mut self, line: u32) -> u32;
+}
+
+struct PendingRead {
+    upstream_request_id: RequestId,
+    addr: u32,
+    index: u32,
+}
+
 pub struct SimpleCache {
     data: CacheData,
     read_port: Port<ReadReq, ReadPort, CacheData>,
@@ -150,6 +194,9 @@ pub struct SimpleCache {
     id_seq: RequestId,
     outbox: VecDeque<SimpleRWResp>,
     downstream: Box<dyn Memory<SimpleRW>>,
+    pending_buffer: HashMap<RequestId, PendingRead>,
+    pending_buffer_size: usize,
+    eviction_policy: Box<dyn EvictionPolicy>,
 }
 
 impl SimpleCache {
@@ -173,6 +220,9 @@ impl SimpleCache {
             id_seq: 0,
             outbox: VecDeque::new(),
             downstream,
+            pending_buffer: HashMap::new(),
+            pending_buffer_size: 16,
+            eviction_policy: Box::new(TreeLRUPolicy::new(d as u32, (1 << k) as u32)),
         }
     }
 
@@ -216,14 +266,52 @@ impl Memory<SimpleRW> for SimpleCache {
         self.read_port.tick(&mut self.data);
         self.write_port.tick(&mut self.data);
 
-        if let Some((id, result)) = self.read_port.pop() {
-            match result {
-                Some(val) => self.outbox.push_back(ReadResp(id, val).into()),
-                None => { /* cache miss — downstream fetch not yet modelled */ }
+        // check if the read port has any results
+        if let Some(read_result) = self.read_port.pop() {
+            // we recompute the index instead of storing it in the
+            //  ReadPortResult, since it is derivable, and would just
+            //  bloat otherwise.
+            let index = (self.data.mask() & read_result.addr) as u32;
+            match read_result.val_and_bank {
+                Some((val, bank)) => {
+                    self.outbox
+                        .push_back(ReadResp(read_result.request_id, val).into());
+                    self.eviction_policy.log_hit(index, bank as u32);
+                }
+                None => {
+                    let downstream_request_id =
+                        self.downstream.send(ReadReq(read_result.addr).into());
+                    self.pending_buffer.insert(
+                        downstream_request_id,
+                        PendingRead {
+                            upstream_request_id: read_result.request_id,
+                            addr: read_result.addr,
+                            index,
+                        },
+                    );
+                }
             }
         }
 
+        // check if the downstream memory returned any requests
+        if let Some(message) = self.downstream.recv() {
+            // we ignore downstream write acknowledgements for now
+            if let SimpleRWResp::Read(ReadResp(id, val)) = message {
+                if let Some(pr) = self.pending_buffer.remove(&id) {
+                    let bank = self.eviction_policy.get_eviction_id(pr.index);
+                    self.data.insert_value(pr.addr, bank, val);
+                    self.eviction_policy.log_hit(pr.index, bank);
+                    self.outbox
+                        .push_back(ReadResp(pr.upstream_request_id, val).into());
+                } else {
+                    panic!("response to non-pending read");
+                }
+            };
+        }
+
+        // check if the write module has any results
         if let Some((id, downstream_req)) = self.write_port.pop() {
+            // maybe this should be moved to the message sorter
             self.downstream.send(downstream_req.into());
             self.outbox.push_back(WriteResp(id).into());
         }
@@ -470,5 +558,236 @@ mod tests {
             Some(SimpleRWResp::Read(ReadResp(_, val))) => assert_eq!(val, 77),
             _ => panic!("expected updated value after write to aliased address"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fill-on-read-miss tests
+    // Downstream memory responds immediately; fill therefore completes in the
+    // same tick the miss is detected.
+    // -----------------------------------------------------------------------
+
+    // Backed downstream: responds to reads with pre-loaded data.
+    struct BackedMemory {
+        data: std::collections::HashMap<u32, u32>,
+        pending: VecDeque<SimpleRWResp>,
+        read_count: Rc<RefCell<u32>>,
+        next_id: RequestId,
+    }
+
+    impl BackedMemory {
+        fn new(data: std::collections::HashMap<u32, u32>) -> (Self, Rc<RefCell<u32>>) {
+            let read_count = Rc::new(RefCell::new(0u32));
+            (
+                Self {
+                    data,
+                    pending: VecDeque::new(),
+                    read_count: read_count.clone(),
+                    next_id: 0,
+                },
+                read_count,
+            )
+        }
+    }
+
+    impl Memory<SimpleRW> for BackedMemory {
+        fn send(&mut self, req: SimpleRWReq) -> RequestId {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if let SimpleRWReq::Read(ReadReq(addr)) = req {
+                *self.read_count.borrow_mut() += 1;
+                let val = self.data.get(&addr).copied().unwrap_or(0);
+                self.pending.push_back(ReadResp(id, val).into());
+            }
+            id
+        }
+        fn recv(&mut self) -> Option<SimpleRWResp> {
+            self.pending.pop_front()
+        }
+        fn tick(&mut self) {}
+    }
+
+    fn make_backed(
+        c: usize,
+        d: usize,
+        data: std::collections::HashMap<u32, u32>,
+    ) -> (SimpleCache, Rc<RefCell<u32>>) {
+        let (mem, read_count) = BackedMemory::new(data);
+        (SimpleCache::new(c, d, Box::new(mem)), read_count)
+    }
+
+    fn read_val(cache: &mut SimpleCache) -> u32 {
+        match cache.recv() {
+            Some(SimpleRWResp::Read(ReadResp(_, v))) => v,
+            _ => panic!("expected ReadResp"),
+        }
+    }
+
+    // A cold read miss fetches from downstream and the value arrives upstream.
+    // Direct-mapped (d=0), assoc=1: miss detected on tick 2, fill same tick.
+    #[test]
+    fn read_miss_fills_cache_and_returns_value() {
+        let (mut cache, _) = make_backed(2, 0, [(0x00, 42)].into());
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        tick_n(&mut cache, 2);
+        assert_eq!(read_val(&mut cache), 42);
+    }
+
+    // The upstream request ID is preserved through the fill path.
+    #[test]
+    fn fill_carries_correct_request_id() {
+        let (mut cache, _) = make_backed(2, 0, [(0x00, 1)].into());
+        let id = cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        tick_n(&mut cache, 2);
+        match cache.recv() {
+            Some(SimpleRWResp::Read(ReadResp(resp_id, _))) => assert_eq!(resp_id, id),
+            _ => panic!("expected ReadResp"),
+        }
+    }
+
+    // After a fill the line is resident; a second read hits without going downstream.
+    #[test]
+    fn filled_line_hits_on_next_read() {
+        let (mut cache, read_count) = make_backed(2, 0, [(0x00, 7)].into());
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        tick_n(&mut cache, 2);
+        cache.recv(); // consume fill response
+
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        cache.tick(); // hit resolves in 1 tick
+        assert_eq!(read_val(&mut cache), 7);
+        assert_eq!(
+            *read_count.borrow(),
+            1,
+            "second read must not go downstream"
+        );
+    }
+
+    // Two sequential misses to different sets: both fill correctly and the
+    // MSHR entry for the first is removed before the second is processed.
+    #[test]
+    fn two_sequential_fills_to_different_sets() {
+        // k=2 (d=0, c=2): set index = addr & 0x3; addr 0x00 → set 0, addr 0x01 → set 1.
+        let (mut cache, _) = make_backed(2, 0, [(0x00, 10), (0x01, 20)].into());
+
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        tick_n(&mut cache, 2);
+        assert_eq!(read_val(&mut cache), 10);
+
+        cache.send(SimpleRWReq::Read(ReadReq(0x01)));
+        tick_n(&mut cache, 2);
+        assert_eq!(read_val(&mut cache), 20);
+    }
+
+    // 2-way cache (d=1, c=2 → k=1, 2 sets): two addresses mapping to the same
+    // set both miss and fill distinct ways, then both hit on the next read.
+    // addr 0x00: set = 0x00 & 1 = 0, tag = 0x00 >> 1 = 0
+    // addr 0x02: set = 0x02 & 1 = 0, tag = 0x02 >> 1 = 1  (same set, different tag)
+    #[test]
+    fn two_way_cache_fills_both_ways_and_both_hit() {
+        let (mut cache, read_count) = make_backed(2, 1, [(0x00, 11), (0x02, 22)].into());
+
+        // First miss: cold PLRU → fills way 0.
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        tick_n(&mut cache, 3); // 2-way: miss detected on tick 3
+        assert_eq!(read_val(&mut cache), 11);
+
+        // Second miss to same set: PLRU updated after first fill → fills way 1.
+        cache.send(SimpleRWReq::Read(ReadReq(0x02)));
+        tick_n(&mut cache, 3);
+        assert_eq!(read_val(&mut cache), 22);
+
+        assert_eq!(*read_count.borrow(), 2, "only two downstream reads");
+
+        // Both lines now resident — subsequent reads hit without going downstream.
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        cache.tick();
+        assert_eq!(read_val(&mut cache), 11);
+
+        cache.send(SimpleRWReq::Read(ReadReq(0x02)));
+        tick_n(&mut cache, 2); // way 1 requires 2 steps
+        assert_eq!(read_val(&mut cache), 22);
+
+        assert_eq!(
+            *read_count.borrow(),
+            2,
+            "no new downstream reads after fills"
+        );
+    }
+
+    // Eviction: once all ways in a set are filled, the next miss to that set
+    // evicts the PLRU victim and the new value is accessible.
+    // 2-way, same set: fill way 0 (addr 0x00), fill way 1 (addr 0x02),
+    // then miss addr 0x04 (set=0, tag=2) → evicts PLRU way → verify new value readable.
+    #[test]
+    fn eviction_replaces_lru_way_and_new_value_is_readable() {
+        let (mut cache, _) = make_backed(2, 1, [(0x00, 1), (0x02, 2), (0x04, 3)].into());
+
+        // Fill way 0, then way 1.
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        tick_n(&mut cache, 3);
+        cache.recv();
+
+        cache.send(SimpleRWReq::Read(ReadReq(0x02)));
+        tick_n(&mut cache, 3);
+        cache.recv();
+
+        // Access 0x00 to make 0x02 the LRU.
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        cache.tick();
+        cache.recv();
+
+        // Miss on 0x04 → should evict 0x02 (LRU) and fill with val=3.
+        cache.send(SimpleRWReq::Read(ReadReq(0x04)));
+        tick_n(&mut cache, 3);
+        assert_eq!(read_val(&mut cache), 3, "evicted way should hold new value");
+    }
+
+    // A write that hits the cache must still be forwarded downstream (write-through).
+    // write_updates_seeded_entry checks the cache side; this checks the downstream side.
+    #[test]
+    fn write_hit_also_forwards_to_downstream() {
+        let (mut cache, downstream_writes) = make_cache(2, 0);
+        cache.seed(0x00, 1);
+        cache.send(SimpleRWReq::Write(WriteReq(0x00, 2)));
+        tick_n(&mut cache, 2);
+        assert!(
+            downstream_writes.borrow().contains(&(0x00, 2)),
+            "write hit must still be forwarded downstream",
+        );
+    }
+
+    // fill → write → read: value written after a fill is what a subsequent read sees.
+    #[test]
+    fn write_to_filled_line_is_readable() {
+        let (mut cache, _) = make_backed(2, 0, [(0x00, 42)].into());
+
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        tick_n(&mut cache, 2);
+        cache.recv(); // consume fill ReadResp
+
+        cache.send(SimpleRWReq::Write(WriteReq(0x00, 99)));
+        tick_n(&mut cache, 2);
+        cache.recv(); // consume WriteResp
+
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        cache.tick();
+        assert_eq!(read_val(&mut cache), 99);
+    }
+
+    // Two reads to the same cold address: the first triggers a fill;
+    // the second (still queued in the port inbox) hits the freshly filled line.
+    #[test]
+    fn second_read_to_same_cold_addr_hits_after_fill() {
+        let (mut cache, read_count) = make_backed(2, 0, [(0x00, 77)].into());
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        cache.send(SimpleRWReq::Read(ReadReq(0x00)));
+        tick_n(&mut cache, 3);
+        assert_eq!(read_val(&mut cache), 77); // first: served via fill
+        assert_eq!(read_val(&mut cache), 77); // second: cache hit
+        assert_eq!(
+            *read_count.borrow(),
+            1,
+            "only one downstream fetch for two reads"
+        );
     }
 }
